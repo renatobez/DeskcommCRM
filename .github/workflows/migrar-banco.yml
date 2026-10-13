@@ -1,0 +1,58 @@
+# .github/workflows/migrar-banco.yml
+#
+# Aplica as migrations pendentes no Supabase a cada push em main que mexa em
+# supabase/migrations/** (ou manualmente, pelo botão "Run workflow").
+#
+# Configuração (uma vez): Settings → Environments → criar "homologacao" (e "producao")
+# e, em cada um, o secret SUPABASE_DB_URL.
+#   Use o "Session pooler" do Supabase (Connect → Session pooler, porta 5432):
+#     postgresql://postgres.<ref>:<senha>@aws-0-<regiao>.pooler.supabase.com:5432/postgres
+#   Não use a conexão direta (é só IPv6 e os runners do GitHub não alcançam)
+#   nem o Transaction pooler (6543).
+#
+# Em "producao" ative "Required reviewers": o job pausa até alguém aprovar.
+
+name: Migrar banco
+
+on:
+  push:
+    branches: [main]
+    paths: ['supabase/migrations/**']
+  workflow_dispatch:
+    inputs:
+      ambiente:
+        description: 'Ambiente'
+        type: choice
+        options: [homologacao, producao]
+        default: homologacao
+      permitir_destrutivas:
+        description: 'Permitir DROP TABLE / DROP COLUMN / TRUNCATE'
+        type: boolean
+        default: false
+
+concurrency:
+  group: migrar-banco-${{ inputs.ambiente || 'homologacao' }}
+  cancel-in-progress: false
+
+jobs:
+  migrar:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.ambiente || 'homologacao' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cliente do Postgres
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client
+
+      - name: Pendentes (dry-run)
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: bash scripts/aplicar-migrations.sh --dry-run
+
+      - name: Aplicar
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          bash scripts/aplicar-migrations.sh ${{ inputs.permitir_destrutivas && '--permitir-destrutivas' || '' }}
