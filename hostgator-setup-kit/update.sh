@@ -180,6 +180,19 @@ if [ -z "$FORCE" ] && [ -z "$MESMA_TAG" ]; then
        bash hostgator-setup-kit/update.sh --to $TARGET_TAG --force" ;;
   esac
 fi
+
+# Aqui já sabemos que há atualização real ou --force. Em ARM64, a release
+# inteira (quatro imagens + WAHA efetiva) é conferida no índice OCI antes de
+# backup, checkout, banco ou contêiner: recusar aqui não deixa nada pela metade.
+# Em AMD64 não há este pré-voo: toda imagem publicada tem amd64, e o preflight
+# geral abaixo (#1955) já confere as quatro imagens em toda arquitetura.
+# Com DESKCOMM_BUILD_LOCAL o escape da #1955 vale aqui também: quem pediu
+# construção local não depende do registro, e recusá-la aqui a anularia
+# justamente com o registro fora.
+PLATAFORMA_HOST="$(plataforma_oci_do_host "$(uname -m 2>/dev/null || true)" 2>/dev/null || true)"
+if [ "$PLATAFORMA_HOST" = linux/arm64 ] && ! build_local_pedido && ! preflight_plataforma_atualizacao "$TARGET_TAG" "$PLATAFORMA_HOST"; then
+  refuse "A versão $TARGET_TAG não está completa para $PLATAFORMA_HOST ou a WAHA configurada é incompatível. Não alterei banco, imagens nem código. Confira o registry e repita."
+fi
 if [ -n "$MESMA_TAG" ] && [ -n "$FORCE" ]; then
   # Com --force na mesma tag ninguém conferiu a imagem: quem chega aqui pediu
   # para refazer (é a saída que a própria atualização ensina quando o banco não
@@ -720,6 +733,15 @@ fi
 # external, but could not be found" — e este script roda sozinho pelo agent.sh,
 # então ninguém está lendo a tela para decifrar isso. Mesma função do install.sh.
 garantir_rede_do_proxy
+# Antes de qualquer `up -d`: a configuração NOVA do Caddy (Caddyfile desta
+# versão + caddy-sites/ do operador + imagem já puxada) passa pela conferência.
+# Recusada, nem o `up -d` do parque nem a recriação lá embaixo tocam no proxy
+# que está no ar (#2724; ver conferir_config_do_proxy em _common.sh).
+PROXY_RECUSA=""
+case "${REVERSE_PROXY:-caddy}" in
+traefik|npm|cloudflared) ;;
+*) conferir_config_do_proxy || true ;;
+esac
 # O `up -d` falha por imagem ausente no disco e, com ele, a atualização inteira:
 # numa VPS de arquitetura diferente da das imagens publicadas o `pull` acima não
 # traz nada. Worker, scheduler e voz têm `build:` ao lado do `image:` e o
@@ -750,7 +772,7 @@ garantir_rede_do_proxy
 # de ERRO, onde este ponto aqui nunca chega a ser alcancado.
 manutencao_desce
 CONSTRUIU_AQUI=""
-if ! dc up -d; then
+if ! subir_o_parque; then
   # ── O PORTÃO DO BUILD LOCAL (#1955, critério 2) ─────────────────────────
   # O gatilho continua sendo o CÓDIGO DE SAÍDA do `up -d` (nunca o texto do
   # erro — arquitetura, tag publicando, pacote privado e registro fora caem no
@@ -798,13 +820,11 @@ fi
 # proxy" em TODA atualização de quem usa proxy externo: alarme falso, num
 # momento em que o dono precisa confiar no que está lendo.
 case "${REVERSE_PROXY:-caddy}" in
-traefik|npm)
+traefik|npm|cloudflared)
   c_grn "✓ proxy externo (${REVERSE_PROXY}): o Caddy não é usado aqui — nada a recarregar"
   ;;
 *)
-  dc up -d --force-recreate --no-deps caddy >/dev/null 2>&1 \
-    && c_grn "✓ proxy recarregado com a configuração desta versão" \
-    || c_ylw "⚠ não consegui recriar o proxy — rode: docker compose $(dc_files) up -d --force-recreate caddy"
+  recriar_o_proxy || true
   ;;
 esac
 

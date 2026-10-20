@@ -16,6 +16,7 @@ readonly RAM_MINIMA_KB=3500000
 
 # shellcheck source=_common.sh
 source "$KIT_DIR/_common.sh"
+source "$KIT_DIR/_supabase-images.sh"
 # SUPABASE_REF vem do _common.sh: o update.sh leva quem já instalou até ela.
 # O SHA-256 é do setup.sh DESSA ref — bump de uma exige o da outra.
 readonly SUPABASE_SETUP_URL="https://raw.githubusercontent.com/supabase/supabase/${SUPABASE_REF}/docker/setup.sh"
@@ -97,11 +98,43 @@ if [[ "${mem_kb:-0}" -lt "$RAM_MINIMA_KB" && "${SINGLE_SERVER_ALLOW_LOW_MEMORY:-
   die "O modo single-server exige pelo menos 4 GB de RAM e recomenda 8 GB. Esta VPS tem aproximadamente $((mem_kb / 1024)) MB."
 fi
 
+# Cloudflare Tunnel não combina com o Supabase self-hosted: neste modo é o Caddy
+# que publica as seis APIs do Supabase (Auth, REST, Realtime, Storage...) pelo
+# Caddyfile.single-server. Com o Caddy desligado, o túnel não tem para onde
+# mandar /auth/v1* e o CRM sobe sem conseguir logar. Recusa ANTES de gerar
+# segredo, baixar imagem ou subir contêiner — falha cedo e barata.
+_rp_cloudflared="${REVERSE_PROXY:-}"
+if [[ -z "$_rp_cloudflared" && -f "$ROOT_DIR/.env" ]]; then
+  _rp_cloudflared="$(ler_env "$ROOT_DIR/.env" REVERSE_PROXY)"
+fi
+if [[ "$_rp_cloudflared" == "cloudflared" ]]; then
+  die "O modo single-server não suporta REVERSE_PROXY=cloudflared: as APIs do Supabase dependem do Caddy. Use o proxy padrão (Caddy), ou o Cloudflare Tunnel apenas com o Supabase na nuvem."
+fi
+unset _rp_cloudflared
+
 # Invariante 8 (docs/doctrine/packaging.md), ANTES de baixar ou subir qualquer
 # coisa: uma segunda árvore do CRM na VPS não sobe um Supabase por cima do da
 # primeira, nem deixa um Supabase órfão para o install.sh recusar depois.
 recusar_projeto_de_outra_arvore || die "Instalação interrompida para não derrubar o CRM que já está no ar nesta VPS."
 recusar_supabase_de_outra_arvore || die "Instalação interrompida para não derrubar o Supabase de outra instalação nesta VPS."
+
+# ARM64: os dois conjuntos são sondados ANTES de .runtime, rede, credenciais e
+# setup. Uma WAHA personalizada (inclusive Plus) vinda do .env existente é
+# preservada pela sonda, e o install.sh repetirá a mesma conferência antes de
+# subir o CRM. Em AMD64 segue como antes: a sonda exige `docker buildx`.
+plataforma="$(plataforma_oci_do_host "$(uname -m 2>/dev/null || true)" 2>/dev/null || true)"
+if [[ "$plataforma" = linux/arm64 ]]; then
+  if [[ -f "$ROOT_DIR/.env" ]]; then load_env "$ROOT_DIR/.env"; fi
+  step "Conferindo imagens publicadas do CRM, WAHA e Supabase para $plataforma"
+  release_tag="$(ultima_release_estavel)"
+  [[ "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+    || die "Não encontrei release numérica publicada; nenhuma parte do Supabase foi criada."
+  waha_efetiva="${WAHA_IMAGE:-$(imagem_waha_padrao_para_host)}"
+  preflight_instalacao "${release_tag#v}" "$plataforma" "$waha_efetiva" \
+    || die "Imagens do CRM ou WAHA incompletas para $plataforma; nenhuma parte do Supabase foi criada."
+  preflight_supabase_da_ref "$SUPABASE_REF" "$plataforma" \
+    || die "Imagens do Supabase incompletas para $plataforma; nenhuma parte foi criada."
+fi
 
 mkdir -p "$RUNTIME_DIR"
 chmod 700 "$RUNTIME_DIR"
@@ -267,13 +300,20 @@ fi
 
 # E-mail de acesso (esqueci a senha, confirmar cadastro): o GoTrue passa a usar
 # o SMTP do CRM. Sem SMTP no CRM, o aviso fica no fim, onde o dono o lê.
+#
+# #2755 — o aviso diz POR QUE rodar o update.sh: o app não leva o SMTP de
+# /admin/email ao GoTrue, quem leva é o `sincronizar_smtp_do_gotrue` de lá. Sem o
+# porquê, "rode o update.sh" na tela final parecia ordem sem motivo — a MESMA
+# correção que a saída do update.sh recebeu. Cuidado com o par: os dois textos
+# vivem separados (este arquivo é shell, com saída em ASCII), e é o teste de
+# shell que cobra o porquê nos dois.
 load_env "$app_env"
 if sincronizar_smtp_do_gotrue; then
   dc_supabase up -d --no-deps auth
   aviso_email="O e-mail de acesso (senha, cadastro) sai pelo SMTP configurado no CRM."
 else
   aviso_email="ATENCAO: sem SMTP, 'esqueci a senha' e a confirmacao de cadastro NAO enviam e-mail.
-Configure em /admin/email e rode: bash hostgator-setup-kit/update.sh"
+Configure em /admin/email e rode bash hostgator-setup-kit/update.sh (ele roda mesmo sem versao nova) - e ele que leva o SMTP ao servico de login."
 fi
 
 cat <<EOF

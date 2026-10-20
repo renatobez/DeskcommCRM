@@ -34,6 +34,15 @@ export interface ContactSnapshot {
   id: string;
   name: string | null;
   display_name: string | null;
+  /**
+   * O nome que a equipe salvou na agenda do celular (PR #2439). Só a equipe o
+   * vê na tela, mas é dado pessoal do titular: a anonimização o apaga
+   * (`trg_contato_anonimizado_esquece_a_agenda`), então o `data.json` o leva.
+   * Quem RECEBE o `data.json` é o titular fora do Brasil: o worker só assina a
+   * ligação dele quando o país não é o padrão (`lgpd-export-worker.ts`). No
+   * Brasil o arquivo fica guardado sem ser enviado, e o PDF não lê este campo.
+   */
+  address_book_name: string | null;
   email: string | null;
   phone_number: string | null;
   cpf_present: boolean;
@@ -588,11 +597,25 @@ export interface ExportPayload {
    */
   lei_citada: string | null;
   /**
-   * Como o documento rotula a citação ("Direito exercido" em Portugal).
-   * AUSENTE no Brasil — o renderizador usa "Base legal" — para o `data.json`
-   * brasileiro sair igual byte a byte (doc 88).
+   * Como o documento rotula a citação ("Direito exercido" em Portugal e,
+   * desde a issue #2344, no Brasil também). AUSENTE no Brasil — o
+   * renderizador lê o rótulo do PERFIL PADRÃO — para o `data.json` brasileiro
+   * sair igual byte a byte (doc 88).
    */
   lei_rotulo?: string;
+  /**
+   * O papel do responsável pelos dados, no vocabulário do país: "Responsável
+   * pelo tratamento" em Portugal (RGPD art. 4.º, n.º 7). AUSENTE no Brasil —
+   * o renderizador usa o rótulo do PERFIL PADRÃO ("Controlador"), pela mesma
+   * régua do `lei_rotulo`: nenhuma chave nova no `data.json` brasileiro.
+   */
+  papel_controlador?: string;
+  /**
+   * O papel de quem recebe os pedidos do titular: "Encarregado da proteção de
+   * dados" em Portugal (RGPD art. 37.º). Ausente no Brasil, que segue com
+   * "Encarregado (DPO)" pelo perfil padrão.
+   */
+  papel_encarregado?: string;
   /**
    * Fuso IANA da organização, para as datas do documento. Ausente no Brasil,
    * que segue no formato de sempre (`America/Sao_Paulo`, sem nome de fuso).
@@ -1061,7 +1084,7 @@ export async function collectExportData(args: CollectArgs): Promise<ExportPayloa
     const { data, error } = await admin
       .from("contacts")
       .select(
-        "id, name, display_name, email, phone_number, wa_lid, cpf_encrypted, birthdate, is_blocked, is_anonymized, consent, tags, source, source_metadata, custom_fields, created_at, last_activity_at, first_service_at",
+        "id, name, display_name, address_book_name, email, phone_number, wa_lid, cpf_encrypted, birthdate, is_blocked, is_anonymized, consent, tags, source, source_metadata, custom_fields, created_at, last_activity_at, first_service_at",
       )
       .eq("organization_id", organizationId)
       .eq("id", contactId)
@@ -1115,6 +1138,7 @@ export async function collectExportData(args: CollectArgs): Promise<ExportPayloa
         id: data.id,
         name: data.name ?? null,
         display_name: data.display_name ?? null,
+        address_book_name: data.address_book_name ?? null,
         email: data.email ?? null,
         phone_number: data.phone_number ?? null,
         cpf_present: Boolean(data.cpf_encrypted),
@@ -2284,16 +2308,20 @@ export async function collectExportData(args: CollectArgs): Promise<ExportPayloa
 }
 
 /**
- * O que só existe no documento FORA do Brasil: o rótulo da citação e o fuso.
- * Para o Brasil devolve `{}` — nenhuma chave nova no `data.json` (doc 88).
+ * O que só existe no documento FORA do Brasil: o rótulo da citação, os papéis
+ * e o fuso. Para o Brasil devolve `{}` — nenhuma chave nova no `data.json`
+ * (doc 88). O rótulo brasileiro ("Direito exercido", issue #2344) e os papéis
+ * brasileiros saem do PERFIL PADRÃO no renderizador, não daqui.
  */
 function foraDoBrasil(
   perfil: PerfilDoPais,
   controlador: Controlador,
-): Pick<ExportPayload, "lei_rotulo" | "fuso"> {
+): Pick<ExportPayload, "lei_rotulo" | "papel_controlador" | "papel_encarregado" | "fuso"> {
   if (perfil.codigo === PAIS_PADRAO) return {};
   return {
     ...(perfil.lei?.rotuloNoDocumento ? { lei_rotulo: perfil.lei.rotuloNoDocumento } : {}),
+    papel_controlador: perfil.papel.controlador,
+    papel_encarregado: perfil.papel.encarregado,
     ...(controlador.timezone ? { fuso: controlador.timezone } : {}),
   };
 }

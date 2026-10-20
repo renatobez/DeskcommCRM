@@ -36,7 +36,7 @@ import {
   type DirecaoDoSilencio,
 } from "@/lib/automation/gatilhos-de-tempo";
 import { configAoSalvarDaTela } from "@/lib/automation/config-ao-salvar";
-import { camposDoFunil } from "@/lib/leads/campos-do-funil";
+import { camposDeDataDoNegocio } from "@/lib/leads/campos-do-funil";
 import {
   useCreateAutomationRule,
   useUpdateAutomationRule,
@@ -53,7 +53,7 @@ interface Props {
   rule: AutomationRuleRow | null;
 }
 
-type Op = "eq" | "neq" | "contains";
+export type Op = "eq" | "neq" | "contains";
 
 interface ConditionRow {
   field: string;
@@ -61,7 +61,7 @@ interface ConditionRow {
   value: string;
 }
 
-interface CuratedField {
+export interface CuratedField {
   value: string;
   label: string;
   op: Op;
@@ -128,7 +128,7 @@ const AGENDAMENTO_FIELDS: CuratedField[] = [
 // ponytail: etapa de destino usa o funil default (cobre o caso comum de 1
 // funil); se o produto ganhar múltiplos funis relevantes aqui, trocar por um
 // seletor de funil antes do de etapa.
-const CURATED_FIELDS: Record<TriggerEvent, CuratedField[]> = {
+export const CURATED_FIELDS: Record<TriggerEvent, CuratedField[]> = {
   "lead.created": LEAD_FIELDS,
   "lead.stage_changed": [...LEAD_FIELDS, STAGE_FIELD],
   // #1528 — os quatro do encerramento/reabertura/atribuição: as condições são
@@ -150,6 +150,10 @@ const CURATED_FIELDS: Record<TriggerEvent, CuratedField[]> = {
   ],
   "lead.tag_added": [...LEAD_FIELDS, TAG_ADDED_FIELD],
   "contact.tag_added": [TAG_ADDED_FIELD],
+  // #2812 — quem filtra "o contato ganhou telefone" filtra por QUEM é o contato
+  // (tags), como o irmão `contact.birthday`: o telefone em si é o gatilho, e
+  // virar condição seria uma regra sempre-verdadeira disfarçada de filtro.
+  "contact.phone_added": CONTACT_FIELDS,
   "appointment.created": AGENDAMENTO_FIELDS,
   "appointment.confirmed": AGENDAMENTO_FIELDS,
   "appointment.rescheduled": AGENDAMENTO_FIELDS,
@@ -177,7 +181,7 @@ const CURATED_FIELDS: Record<TriggerEvent, CuratedField[]> = {
   "lead.stage_stale": [...LEAD_FIELDS, STAGE_FIELD],
 };
 
-const OP_LABELS: Record<Op, string> = { eq: "é", neq: "não é", contains: "contém" };
+export const OP_LABELS: Record<Op, string> = { eq: "é", neq: "não é", contains: "contém" };
 
 function emptyCondition(): ConditionRow {
   return { field: "", op: "eq", value: "" };
@@ -310,9 +314,9 @@ export function RuleEditor({ open, onOpenChange, rule }: Props) {
   const ehGatilhoDeTempo =
     triggerEvent === GATILHO_SILENCIO || triggerEvent === GATILHO_ETAPA_PARADA;
   const ehGatilhoDeNovoContato = triggerEvent === "lead.created";
-  const camposDeData = camposDoFunil(
+  const camposDeData = camposDeDataDoNegocio(
     (pipelinesRes?.data ?? []).find((p) => p.id === configDaData.pipeline_id)?.settings ?? null,
-  ).filter((campo) => campo.type === "date");
+  );
 
   const updateCondition = (idx: number, patch: Partial<ConditionRow>) => {
     setConditions((prev) => prev.map((c, i) => (i === idx ? { ...c, ...patch } : c)));

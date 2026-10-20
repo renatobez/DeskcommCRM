@@ -66,6 +66,13 @@ export const ENTIDADE_ESPERADA_POR_GATILHO = {
   "message.failed": "message",
   "lead.tag_added": "crm_lead",
   "contact.tag_added": "contact",
+  // O contato GANHOU telefone (#2812): a ficha que estava sem número passa a ter
+  // um. É o gatilho que faltava para a operação que só consegue chamar o cliente
+  // no WhatsApp depois que ele informa o número — sem ele, a única saída era o
+  // operador fazer à mão. A entidade é o CONTATO (é dele o dado que mudou), como
+  // os irmãos `contact.tag_added` e `contact.birthday`. O emissor vive em
+  // `app/api/v1/contacts/_handler.ts`, depois do UPDATE que grava o número.
+  "contact.phone_added": "contact",
   // O aniversário nasce do cron `contact-birthdays`, e não de uma ação de
   // alguém: a entidade que ele traz é o próprio contato que faz aniversário.
   "contact.birthday": "contact",
@@ -127,6 +134,13 @@ export const GATILHOS_DO_TRIGGER_DE_LEAD = [
  *
  * ponytail: veto inteiro, não detecção de laço. Cai quando o item 5 da #1528
  * existir (GUC `app.caused_by_rule` copiada pelo trigger para `metadata`).
+ *
+ * A EXCEÇÃO é a continuação do ganho (#2769), tratada em
+ * `acoesQueFechamLaco`: em `lead.won` a ação que a regra DECLARA só tem uma
+ * moda — criar o card no funil de pós-venda, sem tocar no negócio que ganhou.
+ * Quem garante isso é a própria ação (`lib/automation/actions/create-or-move-lead.ts`
+ * recusa `lead.won` no MESMO funil); aqui é só a porta que deixa a regra ser
+ * criada e a tela oferecer o passo.
  */
 export const ACOES_QUE_REGRAVAM_O_LEAD = ["assign_owner", "create_or_move_lead"] as const;
 
@@ -167,7 +181,26 @@ export function acoesQueFechamLaco(
   actions: readonly { type: string; config?: Record<string, unknown> }[] | undefined,
 ): string[] {
   if (!triggerEvent || !(GATILHOS_DO_TRIGGER_DE_LEAD as readonly string[]).includes(triggerEvent)) return [];
-  return tiposDeAcao(actions).filter((t) => (ACOES_QUE_REGRAVAM_O_LEAD as readonly string[]).includes(t));
+  const fecham: string[] = [];
+  for (const acao of actions ?? []) {
+    // A EXCEÇÃO #2769: a porta do ganho. Em `lead.won`, `create_or_move_lead`
+    // declarada NA PRÓPRIA regra é a continuação do negócio para o funil de
+    // pós-venda — ela cria um card NOVO e não escreve no negócio ganho, então o
+    // laço que a #1528 vetou não existe aqui. É a ação que recusa `lead.won` no
+    // MESMO funil, então o caminho "mover o recém-ganho" continua fechado.
+    //
+    // O alvo é ESTREITO de propósito: vale quando a regra declara a ação com o
+    // funil visível no editor. `ai_decide` que ESCOLHE mover fica de fora — o
+    // alvo mora dentro de `config.opcoes`, o modelo decide em tempo de execução
+    // e a recusa da #1528 continua valendo para o par. Ampliar é medir antes.
+    const ehContinuacaoDoGanho = acao.type === "create_or_move_lead" && triggerEvent === "lead.won";
+    for (const tipo of tiposDeAcao([acao])) {
+      if (!(ACOES_QUE_REGRAVAM_O_LEAD as readonly string[]).includes(tipo)) continue;
+      if (ehContinuacaoDoGanho && tipo === "create_or_move_lead") continue;
+      fecham.push(tipo);
+    }
+  }
+  return fecham;
 }
 
 function recusarLacoDeLead(
@@ -190,6 +223,77 @@ export const conditionSchema = z.object({
 });
 
 /**
+ * O `config` de `assign_owner` (#2041): uma pessoa fixa, a forma de sempre, ou
+ * um RODÍZIO, em que a posição na `fila` é a ordem e `pausado` tira a pessoa da
+ * vez sem tirá-la da fila.
+ *
+ * `modo` é o discriminador e é OPCIONAL na forma fixa: as regras gravadas antes
+ * do rodízio têm só `{ user_id }` e continuam válidas sem migração de dados. O
+ * union discriminado (e não `z.union`) mantém o caminho do erro no campo
+ * (`fila`, `user_id`), que é o que a tela usa para dizer o que corrigir.
+ */
+export const configDoAtribuirSchema = z.discriminatedUnion("modo", [
+  z.object({ modo: z.literal("fixo").optional(), user_id: z.string().uuid() }),
+  z.object({
+    modo: z.literal("rodizio"),
+    fila: z
+      .array(z.object({ user_id: z.string().uuid(), pausado: z.boolean() }))
+      .min(1)
+      .max(50)
+      .superRefine((fila, ctx) => {
+        const vistos = new Set<string>();
+        for (const [indice, pessoa] of fila.entries()) {
+          if (vistos.has(pessoa.user_id)) {
+            ctx.addIssue({
+              code: "custom",
+              path: [indice, "user_id"],
+              message: "Cada pessoa entra uma vez só na fila do rodízio.",
+            });
+          }
+          vistos.add(pessoa.user_id);
+        }
+      }),
+  }),
+]);
+
+const ehRodizio = (acao: { type: string; config?: unknown }) =>
+  acao.type === "assign_owner" && (acao.config as { modo?: unknown } | undefined)?.modo === "rodizio";
+
+export const MENSAGEM_DO_RODIZIO_FORA_DO_LUGAR =
+  "Uma automação tem no máximo um rodízio de atendentes, como ação direta: a vez de cada pessoa é contada pela automação.";
+
+/**
+ * Uma regra tem no máximo UM rodízio, e só como ação direta. A vez de cada
+ * pessoa é contada por regra (`fn_automation_rodizio_atribuir` lê a fila da
+ * própria regra), então um segundo rodízio na mesma regra — ou um escondido
+ * dentro de `ai_decide` — andaria pela fila do primeiro, calado.
+ */
+function umRodizioPorRegra(
+  acoes: ReadonlyArray<{ type: string; config?: unknown }>,
+  ctx: z.RefinementCtx,
+): void {
+  let rodizios = 0;
+  for (const [indice, acao] of acoes.entries()) {
+    if (acao.type === "ai_decide") {
+      const opcoes = (acao.config as { opcoes?: Array<{ acao?: { type: string; config?: unknown } }> }).opcoes ?? [];
+      for (const [k, opcao] of opcoes.entries()) {
+        if (opcao.acao && ehRodizio(opcao.acao)) {
+          ctx.addIssue({
+            code: "custom",
+            path: [indice, "config", "opcoes", k, "acao", "config", "modo"],
+            message: MENSAGEM_DO_RODIZIO_FORA_DO_LUGAR,
+          });
+        }
+      }
+      continue;
+    }
+    if (ehRodizio(acao) && ++rodizios > 1) {
+      ctx.addIssue({ code: "custom", path: [indice, "config", "modo"], message: MENSAGEM_DO_RODIZIO_FORA_DO_LUGAR });
+    }
+  }
+}
+
+/**
  * As ações FIXAS do motor — a fonte única de "que ações existem, e com que
  * config".
  *
@@ -204,7 +308,60 @@ export const conditionSchema = z.object({
  */
 const acoesFixas = [
   z.object({ type: z.literal("create_or_move_lead"), config: z.object({ pipeline_id: z.string().uuid(), stage_id: z.string().uuid() }) }),
-  z.object({ type: z.literal("send_whatsapp_message"), config: z.object({ channel_session_id: z.string().uuid(), template: z.string().min(1).max(2000) }) }),
+  z.object({
+    type: z.literal("send_whatsapp_message"),
+    config: z.object({
+      channel_session_id: z.string().uuid(),
+      template: z.string().min(1).max(2000),
+      /**
+       * #2734 — MÍDIA OPCIONAL por URL. Quando presente, o `template` deixa de ser
+       * a mensagem inteira e vira a LEGENDA da imagem/PDF. Opcional de propósito: a
+       * regra antiga (só texto) não tem a chave e continua idêntica. O `nullish`
+       * deixa o editor gravar `null`/ausente sem recusar a regra.
+       *
+       * O `type` (imagem × PDF) NÃO mora aqui: quem o decide é o envio, a partir do
+       * MIME — a extensão da URL quando não há MIME. Guardar uma cópia do tipo no
+       * config criaria uma segunda verdade que envelhece se a URL mudar.
+       */
+      media_url: z.string().url().max(2000).nullish(),
+    }),
+  }),
+  // #2726 — o e-mail como SAÍDA. O transporte não é configuração da regra: ele
+  // já existe em `lib/email` (SMTP ou Resend, escolhido em Admin › E-mail), e
+  // esta ação só diz QUEM recebe, o ASSUNTO e o CORPO. `destinatario` é o modo
+  // (contato / responsável / endereço fixo) e `email_fixo` só existe para o
+  // terceiro — por isso é opcional: exigir endereço num envio ao contato
+  // recusaria na porta a regra que não precisa dele.
+  z.object({
+    type: z.literal("send_email"),
+    config: z.object({
+      destinatario: z.enum(["contato", "dono_do_lead", "fixo"]),
+      // O editor guarda o campo como "" (input controlado) quando o modo não
+      // é `fixo`; "" vira AUSÊNCIA aqui, na porta que o editor e a API
+      // dividem, e não um e-mail inválido. Quem EXIGE o endereço é o
+      // `superRefine` abaixo — só no modo `fixo`.
+      email_fixo: z.preprocess(
+        (v) => (v === "" ? undefined : v),
+        z.string().email("E-mail inválido").max(320).optional(),
+      ),
+      // Assunto e corpo levam as MESMAS variáveis do WhatsApp: `{{nome}}`,
+      // `{{primeiro_nome}}`, `{{lead.*}}` e o campo do funil (`{{destino}}`).
+      assunto: z.string().min(1).max(200),
+      corpo: z.string().min(1).max(5000),
+      // Texto simples (padrão) ou HTML simples — negrito, links e quebras.
+      formato: z.enum(["texto", "html"]).optional(),
+    }).superRefine((config, ctx) => {
+      // Sem isto, `fixo` sem endereço salvaria e só falharia na execução
+      // (`missing_config` em send-email.ts) — a regra "salva" que nunca envia.
+      if (config.destinatario === "fixo" && !config.email_fixo) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["email_fixo"],
+          message: "Informe o endereço de e-mail que recebe os envios desta regra.",
+        });
+      }
+    }),
+  }),
   z.object({
     type: z.literal("add_tag"),
     config: z.object({
@@ -218,7 +375,7 @@ const acoesFixas = [
       destino: z.enum(["card", "contato"]).optional(),
     }),
   }),
-  z.object({ type: z.literal("assign_owner"), config: z.object({ user_id: z.string().uuid() }) }),
+  z.object({ type: z.literal("assign_owner"), config: configDoAtribuirSchema }),
   z.object({
     type: z.literal("send_ai_message"),
     config: z.object({
@@ -253,9 +410,16 @@ const acoesFixas = [
       include_owner: z.boolean().optional(),
     }),
   }),
+  // #2647 — a ação alcança o fluxo de ATENDIMENTO, e o caminho é o do produto
+  // (iniciarFluxoDeAtendimento, `coletando`), não o enroll de follow-up.
+  // `surface` é OPCIONAL de propósito: config sem ela é o follow-up de sempre,
+  // então toda regra já gravada continua apontando para o MESMO fluxo.
   z.object({
     type: z.literal("start_message_flow"),
-    config: z.object({ flow_pointer_id: z.string().uuid() }),
+    config: z.object({
+      flow_pointer_id: z.string().uuid(),
+      surface: z.enum(["followup", "atendimento"]).optional(),
+    }),
   }),
   // #1540 — a ação que NUNCA fala com o cliente: grava `crm_tasks` e avisa o
   // responsável. Advocacia, saúde e serviços regulados precisam do lembrete e
@@ -371,6 +535,16 @@ export const updateWebhookSourceSchema = createWebhookSourceSchema.partial().ext
   name: z.string().trim().min(1).max(120).optional(),
   is_active: z.boolean().optional(),
   authorize_ai_on_capture: z.boolean().optional(),
+  /**
+   * A opção do #2316: quando o `external_id` já existe, ATUALIZAR o card da
+   * MESMA fonte em vez de descartar o envio como reenvio.
+   *
+   * Só entra no PATCH — criar fonte com ela ligada não existe, porque o
+   * segredo que a habilita é da mesma tela e vem depois. Nasce DESLIGADA por
+   * DEFAULT na coluna (migration 0683): quem nunca mexer aqui segue exatamente
+   * como antes do #2316, sem a integração poder reescrever edição manual.
+   */
+  update_existing_lead_on_capture: z.boolean().optional(),
 });
 
 export const createAutomationRuleSchema = z
@@ -378,7 +552,7 @@ export const createAutomationRuleSchema = z
     name: z.string().min(1).max(120),
     trigger_event: z.enum(TRIGGER_EVENTS),
     conditions: z.array(conditionSchema).max(10).default([]),
-    actions: z.array(actionSchema).min(1).max(10),
+    actions: z.array(actionSchema).min(1).max(10).superRefine(umRodizioPorRegra),
     /**
      * O que o gatilho precisa saber além do nome dele (#989).
      *
@@ -464,7 +638,7 @@ export const updateAutomationRuleSchema = z
     name: z.string().min(1).max(120).optional(),
     trigger_event: z.enum(TRIGGER_EVENTS).optional(),
     conditions: z.array(conditionSchema).max(10).optional(),
-    actions: z.array(actionSchema).min(1).max(10).optional(),
+    actions: z.array(actionSchema).min(1).max(10).superRefine(umRodizioPorRegra).optional(),
     trigger_config: z.record(z.string(), z.unknown()).optional(),
     is_active: z.boolean().optional(),
   })

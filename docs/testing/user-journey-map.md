@@ -37,7 +37,7 @@ fonte só (`lib/onboarding/passos.ts`) — eram três listas que discordavam. Ga
 | J1.1 | Login com credenciais do bootstrap | entra e é redirecionado pro `/onboarding` (org sem `onboarded_at`) |
 | J1.2 | Login com senha errada | mensagem clara "Email ou senha incorretos", sem stack |
 | J1.3 | Welcome: termos não aceitos | botão avança desabilitado |
-| J1.4 | Welcome: nome da org + timezone salvos | grava `display_name`/`timezone`, avança pro WhatsApp |
+| J1.4 | Welcome: nome da org + timezone salvos | grava `display_name`/`timezone`, avança pro WhatsApp; o seletor continua funcionando se a tradução do navegador substituir o texto selecionado (`components/ui/select.test.tsx`, `tests/e2e/vps-fresh-onboarding.spec.ts`). Evidência local com tradução simulada e dados sintéticos: `evidence/select-traducao-do-navegador/localizacao-selecionada.png` |
 | J1.5 | Connect WhatsApp: WAHA ativo → QR aparece | sessão criada, QR renderiza via proxy, poll de status roda |
 | J1.6 | Connect WhatsApp: "Pular por enquanto" | avança pro step correto (setup-ai quando Nuvemshop off) |
 | J1.7 | Setup IA: criar agente default | `ai_agents` criado **e a versão publicada aponta para o provedor que a instalação escolheu**, com o modelo curado DAQUELE provedor; avança. **Sem chave de IA** (o `install.sh` deixa pular, e é o ambiente da VPS fresca no CI): o agente nasce rascunho, sem versão, o aviso nomeia o provedor e "Continuar sem publicar" avança para "Onde ele organiza" (`tests/e2e/vps-fresh-onboarding.spec.ts`) |
@@ -1460,6 +1460,8 @@ real, não pela tela).
 
 **Não coberto pela tela:** a publicação (troca da chave de teste pela de produção, D-7); "Tornar isenta" com assinatura viva no provedor; o aviso de 80% do teto de IA; o e-mail dos avisos (o fresco não tem envio configurado, e o checklist mostra isso); o cancelamento de org redigida. Onde são provados: nos testes unitários das rotas e da régua (`lib/cobranca/regua.test.ts`, `lib/cobranca/estado.test.ts`) e nos invariantes da PR 3a. A suspensão usa datas recuadas no banco, não relógio falso: cron e régua rodam com o `now()` real.
 
+**Nota (2026-10-14):** o "Assinar" desta jornada e o "Gerar link de pagamento" do dono (J45) passam pelo mesmo núcleo (`lib/cobranca/checkout.ts`); o contrato do "Assinar" é provado pelo `route.test.ts` dele, mantido sem edição na extração.
+
 **Evidência** (PNG em `evidence/cobranca-revendedor/`):
 - `evidence/cobranca-revendedor/billing-cobranca-agendada.png`
 - `evidence/cobranca-revendedor/billing-em-dia.png`
@@ -1508,6 +1510,66 @@ real, não pela tela).
 - `evidence/cobranca-asaas/billing-asaas-em-dia.png`
 - `evidence/cobranca-asaas/billing-asaas-cancelada.png`
 - `evidence/cobranca-asaas/smoke-asaas.txt`
+
+## J45 — O dono gera o link de pagamento pela empresa e manda pelo WhatsApp `[P0]` (2026-10-14)
+
+**Origem:** link de pagamento pelo dono (`docs/superpowers/specs/2026-09-29-cobranca-do-revendedor-design.md`, D-15, §7(b), §7(g), §9).
+
+É P0 porque é o primeiro pagamento de quem vende para cliente que não entra no sistema: o revendedor fecha a venda no WhatsApp e precisa do link na hora. Sem isso, o dono tinha de entrar como a empresa ou ir ao painel do provedor. Cobre só o que é do dono. A assinatura da empresa, a régua e a suspensão são as da J43 e da J44.
+
+| Caso | Spec | Estado |
+|---|---|---|
+| O dono conecta o Asaas, atribui o plano no card Cobrança do tenant e vê o campo "CPF ou CNPJ de quem paga" vazio (sem CNPJ no cadastro). Vazio ou com dígito errado, "Gerar link de pagamento" fica desligado e nada chega ao Asaas | `tests/e2e/cobranca-link-pelo-dono.spec.ts` | **PASS no CI** (run 38745261432, `d2007b561`) |
+| Com o CPF mascarado, o link aparece somente leitura, com "Copiar link de pagamento", e a tela cabe na largura. O Asaas recebe o CPF sem máscara e o e-mail do **admin da empresa**, nunca o do dono (D-15), com dois admins mais antigos que ele semeados na empresa: o dono, ativo e não provisório (o criador anterior à 0237), e um vínculo provisório que não é dono. Cada um só cai por um dos dois filtros. O CPF não fica na assinatura nem no audit, e o audit diz que foi o dono (`acting_as_platform_admin`, `bypassed_rls`) | idem | **PASS no CI só com o adminB** (run 38745261432, `d2007b561`); com os dois admins mais antigos, a medir no head seguinte |
+| Gerar de novo devolve o MESMO link: antes do aviso do provedor, pelo link vivo; depois, com o checkout limpo, pela fatura aberta (o 409 `pagamento_em_andamento` do núcleo vira 200 para o dono). Um cliente, uma assinatura, um audit | idem | **PASS no CI** (run 38745261432, `d2007b561`) |
+| A empresa entra e vê o mesmo link em "Pagar agora", sem "Assinar"; o "Assinar" dela, chamado direto, devolve 409 com o mesmo link e nenhuma 2ª assinatura. A org do dono não ganha cliente nem assinatura | idem | **PASS no CI** (run 38745261432, `d2007b561`) |
+| A org vem do path (todo filtro com o tenant; `organization_id` no corpo → 400); e-mail do admin, não do dono; audit do dono; fatura aberta → 200; isenta → 404 com a frase do dono; módulo desligado e id inválido → 404 `not_found` ("Not found", sem a frase); `empresa_sem_email` só quando o cliente vai ser criado | `app/api/v1/admin/tenants/[id]/assinatura/checkout/route.test.ts` | unit |
+| O "Assinar" da empresa não mudou de contrato com a extração do núcleo | `app/api/v1/cobranca/assinatura/checkout/route.test.ts` (sem edição) | unit |
+| O admin mais antigo da empresa é o escolhido; sem admin com e-mail → nulo; leitura que falha lança | `lib/cobranca/emails.test.ts` | unit |
+
+**Não coberto pela tela:**
+- **Stripe.** O link é a sessão do Checkout (vale 24 h) e quem paga volta ao login (D-15). Provado no unitário da rota.
+- **`empresa_sem_email` e `sem_link_de_pagamento`.** Exigem estado que a tela não produz de forma barata (empresa sem nenhum admin; assinatura pausada sem fatura). Provados no unitário da rota.
+- **O pagamento em si pelo link.** É o mesmo da J44 (Pix pago no dublê → "Em dia").
+
+**Evidência:** ainda não versionada. A spec grava as duas fotos (o card com o link gerado e o painel da empresa com o mesmo link) na pasta `evidence/cobranca-link-pelo-dono/` quando roda; elas entram aqui, citadas, depois da primeira rodada verde do `e2e`.
+
+## J46 — O anúncio que trouxe a pessoa aparece na conversa e no painel `[P1]` (2026-10-12)
+
+Contexto: pedido de uma operação real (loja com vários produtos anunciados). O
+contato já guardava o anúncio de primeiro toque (`source_metadata.ad_*`), e só
+a ficha do contato o mostrava; a mensagem nascida do clique não guardava de qual
+anúncio veio. A ingestão dos três transportes passa a gravar `metadata.anuncio`
+(título, texto, id, link e miniatura — nunca o clique nem o cru), a bolha dessa
+mensagem leva o cartão do anúncio (imagem, título, texto, «Ver anúncio») e o
+painel ao lado ganha «Anúncio de origem», com o anúncio mais recente quando a
+pessoa voltou por outro (`components/inbox/AnuncioCard.tsx`,
+`components/inbox/AnuncioDoContato.tsx`,
+`app/api/v1/contacts/[id]/crm-summary/route.ts`).
+
+Spec: `tests/e2e/inbox-anuncio-de-origem.spec.ts`.
+
+| # | Caso | Expectativa | Resultado |
+|---|------|-------------|-----------|
+| J46.1 | Abrir a conversa de quem veio de um anúncio e voltou por outro | cada bolha de clique tem o cartão do SEU anúncio, com a imagem carregada (`naturalWidth > 0`) e o link; o painel mostra o anúncio de origem e «Voltou por outro anúncio» com o segundo; os cartões cabem na coluna (`boundingBox`) | **PASS pela tela** — Evidência: `evidence/inbox-anuncio-de-origem/01-anuncio-na-bolha-e-no-painel.png` |
+| J46.2 | Mensagem recebida de um clique, nos três transportes (intermediado, oficial direto, QR) | `metadata.anuncio` com título, texto, id, link e miniatura; sem `ctwa_clid` nem payload cru; sem anúncio, a chave nem aparece; o primeiro toque do contato segue estampado como antes | **PASS (unit)** — `tests/unit/mensagem-guarda-o-seu-anuncio.test.ts` |
+| J46.3 | Endereço do anúncio que não é `https:` (`javascript:`, `data:`, `http:`) | não chega a `href` nem a `src` | **PASS (unit)** — `tests/unit/anuncio-visivel-na-inbox.test.tsx` |
+
+## J47 — Ler a conversa selecionada no tema escuro `[P1]` (2026-10-12)
+
+Contexto: relatado por uma operação real, com a captura — no tema escuro, a linha
+selecionada da lista do Inbox ficava quase branca e o nome do contato sumia. A
+causa: `bg-accent-50`, um degrau da rampa da marca, que tem o MESMO hex nos dois
+temas; o nome é `text-text`, claro no escuro. Passa a `bg-accent-soft`, o token
+que o tema troca (`components/inbox/ConversationListItem.tsx`).
+
+Spec: `tests/e2e/inbox-selecionada-no-escuro.spec.ts`.
+
+| # | Caso | Expectativa | Resultado |
+|---|------|-------------|-----------|
+| J47.1 | Tema escuro, conversa aberta pela lista | o nome do contato na linha selecionada tem contraste ≥ 4,5 contra o fundo EFETIVO (cor computada, camadas translúcidas compostas) | **PASS pela tela** — Evidência: `evidence/inbox-selecionada-no-escuro/01-selecionada-no-escuro.png` |
+| J47.2 | A classe da selecionada | `bg-accent-soft`, nenhum degrau fixo `bg-accent-50…950`; a não selecionada não ganha o fundo | **PASS (unit)** — `tests/unit/selecionada-legivel-no-escuro.test.tsx` |
+| J47.3 | Tema escuro, conversa aberta E marcada no lote, com o mouse ou o foco de teclado | a linha fica num tom só (o botão não pinta por cima do fundo da linha), o foco aparece como anel, e o nome e a prévia seguem com contraste ≥ 4,5 contra o fundo efetivo | **PASS pela tela** — Evidência: `evidence/inbox-selecionada-no-escuro/02-aberta-e-marcada-com-foco.png` |
 
 ## Jornadas exercitadas (instalação final, virgem)
 
@@ -3454,6 +3516,16 @@ Spec: `tests/e2e/mapas-em-provedores.spec.ts`.
 | J40.6 | O que o Google diz × o endereço anotado em 8 pedidos confirmados (28/09/2026, numa instalação real) | município 8/8, região 8/8, localidade 7/8 (na zona rural virou o povoado), rua 3/5, bairro 1/8, número interpolado → a cidade é o MUNICÍPIO; bairro e número não saem | **MEDIDO em produção** (fora deste repositório); regra em `tests/unit/mapas-pino-com-endereco.test.ts` |
 | J40.7 | O pino com endereço aproximado, aberto na conversa pela equipe | o cartão do pino mostra «Rua, Cidade, Estado (aprox.)», com o texto inteiro no `title` (o cartão corta com …) e o toque abre as COORDENADAS no mapa | **PASS pela tela** — Evidência: `evidence/triagem-16set-l12/mapas-03-pino-na-conversa.png` |
 | J40.8 | A API do canal intermediado não responde a tempo na ingestão do pino (medido 29/09/2026: timeout duas vezes seguidas) | a mensagem entra com o marcador e pede nova busca (`message.location_retry_requested`); 1 min depois, e a cada 2 min até 15, busca de novo e grava tipo `location` + link (+ endereço aproximado com chave); nunca rebaixa um pino que já tem coordenadas; desiste sem virar incidente | **PASS (unit)** — `tests/unit/pino-reintento.test.ts`, `tests/unit/channel-ingest-zernio.test.ts` |
+
+### Dados externos — o que o assistente pode ver
+
+| Prioridade | Caso | Prova |
+|---|---|---|
+| [P0] | Conexão nova nasce sem nada liberado e o painel leva a pessoa a escolher | `tests/e2e/integracao-dados-fontes-liberadas.spec.ts` passos 2 e 3 (catálogo simulado na rede; o catálogo real contra um PostgreSQL fica para a prova na VPS) |
+| [P0] | Marcar, descrever e salvar; a lista persiste | mesmo spec, passos 3 e 4 |
+| [P1] | Coluna do cliente travada; modo "tudo" com aviso forte | mesmo spec, passos 3 e 5 |
+| [P1] | Quem só lê vê a lista e não edita | mesmo spec, passo 6 |
+| [P2] | Fonte que sumiu do banco, catálogo fora do ar | só teste de componente (`PainelDeFontes.test.tsx` 6 e 9) |
 
 ## J42 — Gestão de tenants pelo admin da plataforma `[P1]` (2026-09-29, recortada em 2026-10-05)
 
